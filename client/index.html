@@ -3,32 +3,97 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Voice Prompt Streaming</title>
+    <title>Voice Prompt Studio</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
-  <body>
-    <main>
-      <h1>Voice Prompt Streaming Demo</h1>
-      <section class="controls">
-        <button id="recordBtn">Start Recording</button>
-        <button id="stopBtn" disabled>Stop</button>
-        <button id="cancelBtn" disabled>Cancel Reply</button>
+  <body data-theme="dark">
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="brand">
+          <h1>Voice Prompt Studio</h1>
+          <p class="subtitle">Stream speech, text, and audio in real time.</p>
+        </div>
+        <div class="status" id="statusBadge">
+          <span class="status-dot idle" id="statusDot"></span>
+          <span id="statusLabel">Idle</span>
+        </div>
+        <button id="themeToggle" class="btn ghost toggle-btn" aria-label="Toggle theme">
+          <span id="themeLabel">Dark</span>
+        </button>
+      </header>
+
+      <section class="control-panel">
+        <div class="button-group">
+          <button id="recordBtn" class="btn primary">
+            <span>Start Session</span>
+          </button>
+          <button id="stopBtn" class="btn" disabled>
+            <span>Stop Capture</span>
+          </button>
+          <button id="cancelBtn" class="btn ghost" disabled>
+            <span>Cancel Reply</span>
+          </button>
+        </div>
+        <div class="latency-chip" id="latencyChip" aria-label="Latency">Latency &mdash;</div>
       </section>
-      <section class="transcripts">
-        <h2>Transcripts</h2>
-        <div id="partial" class="panel"></div>
-        <div id="final" class="panel"></div>
+
+      <section class="content-grid">
+        <article class="card live-card">
+          <header>
+            <h2>Live Capture</h2>
+            <span class="pill" id="livePill">Idle</span>
+          </header>
+          <div class="live-stream">
+            <div class="stream-block">
+              <span class="label">Partial transcript</span>
+              <p id="partial" class="stream-text"></p>
+            </div>
+            <div class="stream-block">
+              <span class="label">Assistant stream</span>
+              <p id="tokens" class="stream-text"></p>
+            </div>
+          </div>
+        </article>
+
+        <article class="card conversation-card">
+          <header>
+            <h2>Conversation Timeline</h2>
+          </header>
+          <ol id="timeline" class="timeline"></ol>
+        </article>
+
+        <article class="card metrics-card">
+          <header>
+            <h2>Latency</h2>
+            <button class="btn ghost" id="clearMetricsBtn">Clear</button>
+          </header>
+          <pre id="metrics"></pre>
+        </article>
+
+        <article class="card transcript-card">
+          <header>
+            <h2>Final transcript</h2>
+          </header>
+          <div id="final" class="transcript-panel"></div>
+        </article>
+
+        <article class="card audio-card">
+          <header>
+            <h2>Playback</h2>
+            <span class="pill" id="audioStatus">Queue empty</span>
+          </header>
+          <audio id="player" controls></audio>
+        </article>
+
+        <article class="card logs-card">
+          <header>
+            <h2>Server Logs</h2>
+            <button class="btn ghost" id="clearLogsBtn">Clear</button>
+          </header>
+          <pre id="logsPanel" class="logs-panel"></pre>
+        </article>
       </section>
-      <section class="assistant">
-        <h2>Assistant Tokens</h2>
-        <div id="tokens" class="panel"></div>
-      </section>
-      <section class="latency">
-        <h2>Latency Metrics</h2>
-        <pre id="metrics"></pre>
-      </section>
-    </main>
-    <audio id="player" controls></audio>
+    </div>
     <script type="module" src="/static/main.js"></script>
   </body>
 </html>

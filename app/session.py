@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 from typing import Any
@@ -12,6 +13,7 @@ from .asr import StreamingTranscriber
 from .audio_buffer import AudioBuffer
 from .config import settings
 from .llm import ChatMessage, LLMConfig, LLMStreamer
+from .logging_utils import SessionLogHandler
 from .tts import PhraseAggregator, TTSPipeline
 from .vad import SilenceTracker
 
@@ -44,9 +46,18 @@ class SessionState:
         self._transcript_seq = 0
         self._conversation: list[ChatMessage] = []
         self._loop = asyncio.get_event_loop()
+        self._log_queue: asyncio.Queue[str] | None = None
+        self._log_handler: SessionLogHandler | None = None
+        self._log_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         self._metrics.clear()
+        self._log_queue = asyncio.Queue(maxsize=200)
+        self._log_handler = SessionLogHandler(self._loop, self._log_queue)
+        formatter = logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+        self._log_handler.setFormatter(formatter)
+        logging.getLogger().addHandler(self._log_handler)
+        self._log_task = asyncio.create_task(self._pump_logs())
 
     async def handle_message(self, message: Any) -> None:
         if isinstance(message, (bytes, bytearray)):
@@ -57,6 +68,16 @@ class SessionState:
     async def close(self) -> None:
         await self.cancel_reply()
         self._log_metrics()
+        if self._log_handler:
+            logging.getLogger().removeHandler(self._log_handler)
+            self._log_handler = None
+        if self._log_task:
+            self._log_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._log_task
+            self._log_task = None
+        if self._log_queue:
+            self._log_queue = None
 
     async def _handle_json(self, message: Any) -> None:
         if isinstance(message, str):
@@ -219,6 +240,16 @@ class SessionState:
                 deltas[key] = round((timestamp - t0) * 1000, 2)
         if deltas:
             logger.info("Latency ms: %s", deltas)
+
+    async def _pump_logs(self) -> None:
+        if not self._log_queue:
+            return
+        try:
+            while True:
+                message = await self._log_queue.get()
+                await self.websocket.send_json({"type": "log", "message": message})
+        except asyncio.CancelledError:  # pragma: no cover - coordination path
+            pass
 
 
 class TTSSessionSink:

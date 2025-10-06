@@ -9,6 +9,17 @@ const finalPanel = document.getElementById("final");
 const tokensPanel = document.getElementById("tokens");
 const metricsPanel = document.getElementById("metrics");
 const player = document.getElementById("player");
+const statusDot = document.getElementById("statusDot");
+const statusLabel = document.getElementById("statusLabel");
+const livePill = document.getElementById("livePill");
+const latencyChip = document.getElementById("latencyChip");
+const timeline = document.getElementById("timeline");
+const audioStatus = document.getElementById("audioStatus");
+const clearMetricsBtn = document.getElementById("clearMetricsBtn");
+const themeToggle = document.getElementById("themeToggle");
+const themeLabel = document.getElementById("themeLabel");
+const logsPanel = document.getElementById("logsPanel");
+const clearLogsBtn = document.getElementById("clearLogsBtn");
 
 let ws;
 let audioContext;
@@ -22,10 +33,115 @@ const playbackQueue = [];
 let nextSeqToPlay = 1;
 let playing = false;
 let currentAudioUrl = null;
+let pendingAssistant = "";
+const conversation = [];
+const logsBuffer = [];
+const THEME_KEY = "voice_prompt_theme";
 
 recordBtn.addEventListener("click", () => startRecording());
 stopBtn.addEventListener("click", () => stopRecording());
 cancelBtn.addEventListener("click", () => sendCancel());
+clearMetricsBtn.addEventListener("click", () => {
+  metrics = {};
+  metricsPanel.textContent = "";
+  latencyChip.textContent = "Latency —";
+});
+
+if (clearLogsBtn) {
+  clearLogsBtn.addEventListener("click", () => {
+    logsBuffer.length = 0;
+    renderLogs();
+  });
+}
+
+function applyTheme(theme) {
+  document.body.dataset.theme = theme;
+  if (themeLabel) {
+    themeLabel.textContent = theme === "light" ? "Light" : "Dark";
+  }
+}
+
+function loadTheme() {
+  const stored = localStorage.getItem(THEME_KEY);
+  if (stored === "light" || stored === "dark") {
+    return stored;
+  }
+  return window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches
+    ? "light"
+    : "dark";
+}
+
+const initialTheme = loadTheme();
+applyTheme(initialTheme);
+
+if (themeToggle) {
+  themeToggle.addEventListener("click", () => {
+    const next = document.body.dataset.theme === "dark" ? "light" : "dark";
+    applyTheme(next);
+    localStorage.setItem(THEME_KEY, next);
+  });
+}
+
+function setStatus(state) {
+  statusDot.classList.remove("active", "busy");
+  switch (state) {
+    case "recording":
+      statusDot.classList.add("active");
+      statusLabel.textContent = "Recording";
+      break;
+    case "responding":
+      statusDot.classList.add("busy");
+      statusLabel.textContent = "Responding";
+      break;
+    case "idle":
+    default:
+      statusLabel.textContent = "Idle";
+      break;
+  }
+}
+
+function setLiveState(text) {
+  livePill.textContent = text;
+}
+
+function pushConversation(role, text) {
+  if (!text.trim()) return;
+  conversation.push({ role, text: text.trim() });
+  while (conversation.length > 12) {
+    conversation.shift();
+  }
+  renderTimeline();
+}
+
+function renderTimeline() {
+  timeline.innerHTML = "";
+  conversation.forEach((item) => {
+    const li = document.createElement("li");
+    li.className = "timeline-item";
+    const role = document.createElement("span");
+    role.className = "role";
+    role.textContent = item.role;
+    const text = document.createElement("p");
+    text.className = "text";
+    text.textContent = item.text;
+    li.append(role, text);
+    timeline.append(li);
+  });
+}
+
+function appendLog(message) {
+  logsBuffer.push(message);
+  if (logsBuffer.length > 200) {
+    logsBuffer.splice(0, logsBuffer.length - 200);
+  }
+  renderLogs();
+}
+
+function renderLogs() {
+  if (!logsPanel) return;
+  logsPanel.textContent = logsBuffer.join("\n");
+  logsPanel.scrollTop = logsPanel.scrollHeight;
+}
 
 async function startRecording() {
   if (recording) return;
@@ -41,6 +157,9 @@ async function startRecording() {
   tokensPanel.textContent = "";
   metricsPanel.textContent = "";
   metrics = { t0_user_audio_start: performance.now() };
+  pendingAssistant = "";
+  setStatus("recording");
+  setLiveState("Listening");
   ws.send(JSON.stringify({ type: "start", sample_rate: SAMPLE_RATE }));
 }
 
@@ -52,6 +171,7 @@ async function stopRecording() {
   stopBtn.disabled = true;
   cancelBtn.disabled = true;
   ws.send(JSON.stringify({ type: "stop" }));
+  setLiveState("Processing");
 }
 
 async function sendCancel() {
@@ -59,6 +179,8 @@ async function sendCancel() {
   ws.send(JSON.stringify({ type: "cancel" }));
   resetPlayback();
   cancelBtn.disabled = true;
+  setStatus("idle");
+  setLiveState("Cancelled");
 }
 
 function teardownAudio() {
@@ -90,6 +212,8 @@ async function ensureWebSocket() {
     recordBtn.disabled = false;
     stopBtn.disabled = true;
     cancelBtn.disabled = true;
+    setStatus("idle");
+    setLiveState("Disconnected");
   };
   ws.onerror = (err) => console.error("WebSocket error", err);
   ws.onmessage = (event) => handleServerMessage(event);
@@ -126,15 +250,24 @@ function handleServerMessage(event) {
     case "partial_transcript":
       partialPanel.textContent = data.text;
       if (!metrics.t1_first_partial) metrics.t1_first_partial = performance.now();
+      setLiveState("Listening");
       break;
     case "final_transcript":
       finalPanel.textContent = data.text;
       if (!metrics.t2_final_transcript) metrics.t2_final_transcript = performance.now();
+      pushConversation("User", data.text);
+      setStatus("responding");
+      setLiveState("Processing");
       break;
     case "llm_token":
       if (!data.done) {
-        tokensPanel.textContent += data.text;
+        pendingAssistant += data.text;
+        tokensPanel.textContent = pendingAssistant;
         if (!metrics.t3_first_llm_token) metrics.t3_first_llm_token = performance.now();
+        setLiveState("Responding");
+      } else if (pendingAssistant) {
+        pushConversation("Assistant", pendingAssistant);
+        pendingAssistant = "";
       }
       break;
     case "tts_chunk":
@@ -147,12 +280,19 @@ function handleServerMessage(event) {
       if (!recording) {
         tryPlayAudio();
       }
+      if (!recording) {
+        setStatus("idle");
+        setLiveState("Idle");
+      }
       break;
     case "info":
       console.log("info", data.message);
       break;
     case "error":
       console.error("error", data.message);
+      break;
+    case "log":
+      appendLog(data.message);
       break;
   }
   updateMetrics();
@@ -167,6 +307,7 @@ function handleTtsChunk({ seq, audio_b64 }) {
   }
   entry.chunks.push(bytes);
   if (!metrics.t4_first_tts_audio) metrics.t4_first_tts_audio = performance.now();
+  updateAudioStatus();
 }
 
 function finalizePhrase(seq) {
@@ -174,6 +315,7 @@ function finalizePhrase(seq) {
   if (!entry) return;
   entry.done = true;
   tryPlayAudio();
+  updateAudioStatus();
 }
 
 function tryPlayAudio() {
@@ -188,6 +330,7 @@ function tryPlayAudio() {
   if (!playing) {
     playNext();
   }
+  updateAudioStatus();
 }
 
 async function playNext() {
@@ -198,18 +341,16 @@ async function playNext() {
   playing = true;
   const blob = playbackQueue.shift();
   const url = URL.createObjectURL(blob);
+  if (currentAudioUrl) {
+    URL.revokeObjectURL(currentAudioUrl);
+  }
   player.src = url;
   currentAudioUrl = url;
-  try {
-    await player.play();
-  } catch (err) {
-    console.warn("Autoplay blocked", err);
-  }
+  player.load();
   player.onended = () => {
-    URL.revokeObjectURL(url);
-    currentAudioUrl = null;
     playing = false;
     playNext();
+    updateAudioStatus();
   };
 }
 
@@ -226,6 +367,7 @@ function resetPlayback() {
     currentAudioUrl = null;
   }
   player.removeAttribute("src");
+  updateAudioStatus();
 }
 
 function updateMetrics() {
@@ -245,6 +387,8 @@ function updateMetrics() {
     lines.push(` first audio: ${(metrics.t4_first_tts_audio - base).toFixed(1)}`);
   }
   metricsPanel.textContent = lines.join("\n");
+  const latency = metrics.t4_first_tts_audio || metrics.t3_first_llm_token || metrics.t2_final_transcript;
+  latencyChip.textContent = latency ? `Latency ${(latency - base).toFixed(0)} ms` : "Latency —";
 }
 
 function base64ToBytes(b64) {
@@ -254,6 +398,17 @@ function base64ToBytes(b64) {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
+}
+
+function updateAudioStatus() {
+  const queueSize = playbackQueue.length + phraseBuffers.size;
+  if (playing) {
+    audioStatus.textContent = "Playing";
+  } else if (queueSize > 0) {
+    audioStatus.textContent = `${queueSize} chunk${queueSize > 1 ? "s" : ""} queued`;
+  } else {
+    audioStatus.textContent = "Queue empty";
+  }
 }
 
 window.addEventListener("beforeunload", () => {
