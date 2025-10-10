@@ -52,6 +52,13 @@ class AudioBuffer:
         collected.reverse()
         return b"".join(collected)
 
+    def pop_all(self) -> bytes:
+        if not self._buffer:
+            return b""
+        data = b"".join(self._buffer)
+        self.clear()
+        return data
+
     def _trim_if_needed(self) -> None:
         max_samples = self._max_samples
         if self._total_samples <= max_samples:

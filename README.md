@@ -3,7 +3,7 @@
 Modern real-time voice experience that streams ASR partials, LLM tokens, and TTS audio over WebSockets with a monitoring-friendly UI.
 
 ## Features
-- **Low-latency pipeline** using FastAPI, faster-whisper (tiny.en default), streaming LLM, phrase-based TTS, and per-session latency metrics.
+- **Low-latency pipeline** using FastAPI, pywhispercpp (tiny.en-q5_1 default), streaming LLM, phrase-based TTS, and per-session latency metrics.
 - **Modern web client** with live capture status, conversation timeline, manual playback queue, real-time server log pane, and light/dark themes.
 - **WebSocket protocol** for binary PCM upload (16 kHz mono) plus JSON control and rich server-to-client events (`partial_transcript`, `llm_token`, `tts_chunk`, etc.).
 - **Resilience** via VAD-based end-of-speech detection, cancellation handling, and graceful error messages surfaced directly in the UI.
@@ -16,8 +16,14 @@ Modern real-time voice experience that streams ASR partials, LLM tokens, and TTS
 2. Open `http://localhost:8000` in a Chromium or Firefox browser, allow microphone access, and use the control panel to start/stop streaming.
 
 ### Environment Tweaks
-- `STREAM_MODEL_WHISPER` (e.g. `base.en`) and `STREAM_MODEL_DEVICE`/`STREAM_MODEL_COMPUTE` control ASR size and target (CPU/GPU).
+- `STREAM_MODEL_WHISPER` (e.g. `small.en`) and `STREAM_MODEL_DEVICE`/`STREAM_MODEL_COMPUTE` control ASR size and target (CPU/GPU).
 - `OPENAI_API_KEY` enables real LLM streaming; otherwise a synthetic token generator echoes responses.
+
+### Operational Tips
+- **Accuracy vs. speed:** `small.en` with the in-app **Fast** cadence preset gives the best balance we’ve measured. Set it before launch, e.g. `export STREAM_MODEL_WHISPER=small.en` then run `./run.sh`.
+- **Model selection is backend-only:** there’s no UI toggle; restart the server after changing `STREAM_MODEL_WHISPER`.
+- **Clean shutdowns:** `run.sh` uses `uvicorn --reload`, which needs two `Ctrl+C` presses. For single-interrupt exits run uvicorn manually without `--reload`.
+- **Short audio warnings:** Whisper logs “input is too short < 1000 ms” when partial windows contain <1s of audio; it is harmless but you can increase `STREAM_PARTIAL_WINDOW_S` if it becomes noisy in logs.
 
 ### UI Highlights
 - Control panel exposes latency chip and theme toggle.

@@ -1,5 +1,5 @@
 const SAMPLE_RATE = 16000;
-const CHUNK_MS = 320;
+const CHUNK_MS = 160;
 
 const recordBtn = document.getElementById("recordBtn");
 const stopBtn = document.getElementById("stopBtn");
@@ -8,18 +8,17 @@ const partialPanel = document.getElementById("partial");
 const finalPanel = document.getElementById("final");
 const tokensPanel = document.getElementById("tokens");
 const metricsPanel = document.getElementById("metrics");
-const player = document.getElementById("player");
 const statusDot = document.getElementById("statusDot");
 const statusLabel = document.getElementById("statusLabel");
 const livePill = document.getElementById("livePill");
 const latencyChip = document.getElementById("latencyChip");
 const timeline = document.getElementById("timeline");
-const audioStatus = document.getElementById("audioStatus");
 const clearMetricsBtn = document.getElementById("clearMetricsBtn");
 const themeToggle = document.getElementById("themeToggle");
 const themeLabel = document.getElementById("themeLabel");
 const logsPanel = document.getElementById("logsPanel");
 const clearLogsBtn = document.getElementById("clearLogsBtn");
+const cadenceSelect = document.getElementById("cadenceSelect");
 
 let ws;
 let audioContext;
@@ -27,22 +26,20 @@ let workletNode;
 let mediaStream;
 let recording = false;
 let metrics = {};
+let totalAudioDurationMs = 0;
 
-const phraseBuffers = new Map();
-const playbackQueue = [];
-let nextSeqToPlay = 1;
-let playing = false;
-let currentAudioUrl = null;
 let pendingAssistant = "";
 const conversation = [];
 const logsBuffer = [];
 const THEME_KEY = "voice_prompt_theme";
+const CADENCE_KEY = "voice_prompt_cadence";
 
 recordBtn.addEventListener("click", () => startRecording());
 stopBtn.addEventListener("click", () => stopRecording());
 cancelBtn.addEventListener("click", () => sendCancel());
 clearMetricsBtn.addEventListener("click", () => {
   metrics = {};
+  totalAudioDurationMs = 0;
   metricsPanel.textContent = "";
   latencyChip.textContent = "Latency —";
 });
@@ -53,6 +50,18 @@ if (clearLogsBtn) {
     renderLogs();
   });
 }
+
+function restoreSelect(select, key) {
+  if (!select) return;
+  const stored = localStorage.getItem(key);
+  if (stored && [...select.options].some((option) => option.value === stored)) {
+    select.value = stored;
+  }
+  select.addEventListener("change", () => {
+    localStorage.setItem(key, select.value);
+  });
+}
+restoreSelect(cadenceSelect, CADENCE_KEY);
 
 function applyTheme(theme) {
   document.body.dataset.theme = theme;
@@ -151,7 +160,6 @@ async function startRecording() {
   recordBtn.disabled = true;
   stopBtn.disabled = false;
   cancelBtn.disabled = false;
-  resetPlayback();
   partialPanel.textContent = "";
   finalPanel.textContent = "";
   tokensPanel.textContent = "";
@@ -160,7 +168,11 @@ async function startRecording() {
   pendingAssistant = "";
   setStatus("recording");
   setLiveState("Listening");
-  ws.send(JSON.stringify({ type: "start", sample_rate: SAMPLE_RATE }));
+  const startPayload = { type: "start", sample_rate: SAMPLE_RATE };
+  if (cadenceSelect && cadenceSelect.value) {
+    startPayload.cadence = cadenceSelect.value;
+  }
+  ws.send(JSON.stringify(startPayload));
 }
 
 async function stopRecording() {
@@ -177,7 +189,6 @@ async function stopRecording() {
 async function sendCancel() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({ type: "cancel" }));
-  resetPlayback();
   cancelBtn.disabled = true;
   setStatus("idle");
   setLiveState("Cancelled");
@@ -208,7 +219,6 @@ async function ensureWebSocket() {
     console.log("WebSocket closed");
     recording = false;
     teardownAudio();
-    resetPlayback();
     recordBtn.disabled = false;
     stopBtn.disabled = true;
     cancelBtn.disabled = true;
@@ -240,6 +250,7 @@ async function setupAudio() {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(data);
     }
+    totalAudioDurationMs += (data.byteLength / 2 / SAMPLE_RATE) * 1000;
   };
 }
 
@@ -258,6 +269,10 @@ function handleServerMessage(event) {
       pushConversation("User", data.text);
       setStatus("responding");
       setLiveState("Processing");
+      if (!metrics.audio_duration_ms && totalAudioDurationMs) {
+        metrics.audio_duration_ms = totalAudioDurationMs;
+        totalAudioDurationMs = 0;
+      }
       break;
     case "llm_token":
       if (!data.done) {
@@ -265,25 +280,18 @@ function handleServerMessage(event) {
         tokensPanel.textContent = pendingAssistant;
         if (!metrics.t3_first_llm_token) metrics.t3_first_llm_token = performance.now();
         setLiveState("Responding");
-      } else if (pendingAssistant) {
-        pushConversation("Assistant", pendingAssistant);
-        pendingAssistant = "";
-      }
-      break;
-    case "tts_chunk":
-      handleTtsChunk(data);
-      break;
-    case "tts_phrase_done":
-      finalizePhrase(data.seq);
-      break;
-    case "tts_complete":
-      if (!recording) {
-        tryPlayAudio();
-      }
-      if (!recording) {
+      } else {
+        if (pendingAssistant) {
+          pushConversation("Assistant", pendingAssistant);
+          pendingAssistant = "";
+        }
         setStatus("idle");
         setLiveState("Idle");
       }
+      break;
+    case "reply_complete":
+      setStatus("idle");
+      setLiveState("Idle");
       break;
     case "info":
       console.log("info", data.message);
@@ -298,117 +306,37 @@ function handleServerMessage(event) {
   updateMetrics();
 }
 
-function handleTtsChunk({ seq, audio_b64 }) {
-  const bytes = base64ToBytes(audio_b64);
-  let entry = phraseBuffers.get(seq);
-  if (!entry) {
-    entry = { chunks: [], done: false };
-    phraseBuffers.set(seq, entry);
-  }
-  entry.chunks.push(bytes);
-  if (!metrics.t4_first_tts_audio) metrics.t4_first_tts_audio = performance.now();
-  updateAudioStatus();
-}
-
-function finalizePhrase(seq) {
-  const entry = phraseBuffers.get(seq);
-  if (!entry) return;
-  entry.done = true;
-  tryPlayAudio();
-  updateAudioStatus();
-}
-
-function tryPlayAudio() {
-  while (phraseBuffers.has(nextSeqToPlay)) {
-    const entry = phraseBuffers.get(nextSeqToPlay);
-    if (!entry.done) break;
-    const blob = new Blob(entry.chunks, { type: "audio/wav" });
-    playbackQueue.push(blob);
-    phraseBuffers.delete(nextSeqToPlay);
-    nextSeqToPlay += 1;
-  }
-  if (!playing) {
-    playNext();
-  }
-  updateAudioStatus();
-}
-
-async function playNext() {
-  if (!playbackQueue.length) {
-    playing = false;
-    return;
-  }
-  playing = true;
-  const blob = playbackQueue.shift();
-  const url = URL.createObjectURL(blob);
-  if (currentAudioUrl) {
-    URL.revokeObjectURL(currentAudioUrl);
-  }
-  player.src = url;
-  currentAudioUrl = url;
-  player.load();
-  player.onended = () => {
-    playing = false;
-    playNext();
-    updateAudioStatus();
-  };
-}
-
-function resetPlayback() {
-  phraseBuffers.clear();
-  playbackQueue.length = 0;
-  nextSeqToPlay = 1;
-  playing = false;
-  player.pause();
-  player.currentTime = 0;
-  player.onended = null;
-  if (currentAudioUrl) {
-    URL.revokeObjectURL(currentAudioUrl);
-    currentAudioUrl = null;
-  }
-  player.removeAttribute("src");
-  updateAudioStatus();
-}
-
 function updateMetrics() {
   if (!metrics.t0_user_audio_start) return;
-  const lines = ["Latency (ms):"];
+  const lines = ["Latency (MM:SS.ss):"];
   const base = metrics.t0_user_audio_start;
   if (metrics.t1_first_partial) {
-    lines.push(` first partial: ${(metrics.t1_first_partial - base).toFixed(1)}`);
+    lines.push(` first partial: ${formatDuration(metrics.t1_first_partial - base)}`);
   }
   if (metrics.t2_final_transcript) {
-    lines.push(` final transcript: ${(metrics.t2_final_transcript - base).toFixed(1)}`);
+    lines.push(` final transcript: ${formatDuration(metrics.t2_final_transcript - base)}`);
   }
   if (metrics.t3_first_llm_token) {
-    lines.push(` first token: ${(metrics.t3_first_llm_token - base).toFixed(1)}`);
+    lines.push(` first token: ${formatDuration(metrics.t3_first_llm_token - base)}`);
   }
-  if (metrics.t4_first_tts_audio) {
-    lines.push(` first audio: ${(metrics.t4_first_tts_audio - base).toFixed(1)}`);
+  if (metrics.audio_duration_ms) {
+    lines.push(` audio captured: ${formatDuration(metrics.audio_duration_ms)}`);
   }
   metricsPanel.textContent = lines.join("\n");
-  const latency = metrics.t4_first_tts_audio || metrics.t3_first_llm_token || metrics.t2_final_transcript;
-  latencyChip.textContent = latency ? `Latency ${(latency - base).toFixed(0)} ms` : "Latency —";
+  const latency = metrics.t3_first_llm_token || metrics.t2_final_transcript;
+  latencyChip.textContent = latency
+    ? `Latency ${formatDuration(latency - base)}`
+    : "Latency —";
 }
 
-function base64ToBytes(b64) {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
-function updateAudioStatus() {
-  const queueSize = playbackQueue.length + phraseBuffers.size;
-  if (playing) {
-    audioStatus.textContent = "Playing";
-  } else if (queueSize > 0) {
-    audioStatus.textContent = `${queueSize} chunk${queueSize > 1 ? "s" : ""} queued`;
-  } else {
-    audioStatus.textContent = "Queue empty";
-  }
+function formatDuration(ms) {
+  if (!Number.isFinite(ms)) return "0:00.00";
+  const totalSeconds = ms / 1000;
+  const minutes = Math.floor(totalSeconds / 60)
+    .toString()
+    .padStart(2, "0");
+  const seconds = (totalSeconds % 60).toFixed(2).padStart(5, "0");
+  return `${minutes}:${seconds}`;
 }
 
 window.addEventListener("beforeunload", () => {
