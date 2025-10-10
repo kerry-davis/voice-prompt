@@ -24,7 +24,7 @@
 
       <section class="control-panel">
         <div class="button-group">
-          <button id="recordBtn" class="btn primary">
+          <button id="recordBtn" class="btn">
             <span>Start Session</span>
           </button>
           <button id="stopBtn" class="btn" disabled>
@@ -35,6 +35,16 @@
           </button>
         </div>
         <div class="latency-chip" id="latencyChip" aria-label="Latency">Latency &mdash;</div>
+        <div class="control-options">
+          <label class="control-field">
+            <span>Cadence</span>
+            <select id="cadenceSelect">
+              <option value="fast">Fast</option>
+              <option value="balanced" selected>Balanced</option>
+              <option value="accurate">Accurate</option>
+            </select>
+          </label>
+        </div>
       </section>
 
       <section class="content-grid">
@@ -77,20 +87,14 @@
           <div id="final" class="transcript-panel"></div>
         </article>
 
-        <article class="card audio-card">
-          <header>
-            <h2>Playback</h2>
-            <span class="pill" id="audioStatus">Queue empty</span>
-          </header>
-          <audio id="player" controls></audio>
-        </article>
-
         <article class="card logs-card">
           <header>
             <h2>Server Logs</h2>
             <button class="btn ghost" id="clearLogsBtn">Clear</button>
           </header>
-          <pre id="logsPanel" class="logs-panel"></pre>
+          <div class="logs-wrapper">
+            <pre id="logsPanel" class="logs-panel"></pre>
+          </div>
         </article>
       </section>
     </div>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import base64
 from pathlib import Path
@@ -14,7 +15,6 @@ from .asr import StreamingTranscriber
 from .config import settings
 from .llm import LLMConfig, LLMStreamer
 from .session import SessionState
-from .tts import TTSPipeline
 
 
 logging.basicConfig(level=logging.INFO)
@@ -24,14 +24,15 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def _startup() -> None:
+    loop = asyncio.get_running_loop()
     app.state.transcriber = StreamingTranscriber(
         settings.whisper_model,
         settings.sample_rate,
         device=settings.whisper_device,
         compute_type=settings.whisper_compute_type,
+        loop=loop,
     )
     app.state.llm = LLMStreamer(LLMConfig(model=settings.openai_model, temperature=settings.llm_temperature))
-    app.state.tts_pipeline = TTSPipeline()
 
 
 @app.get("/")
@@ -50,7 +51,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         websocket,
         transcriber=app.state.transcriber,
         llm=app.state.llm,
-        tts=app.state.tts_pipeline,
     )
     await session.start()
     try:
@@ -100,15 +100,9 @@ async def legacy_voice(request: VoiceRequest) -> dict[str, str]:
         tokens.append(token)
     assistant_reply = "".join(tokens).strip()
 
-    audio_parts: list[bytes] = []
-    async for chunk in app.state.tts_pipeline.synthesize(assistant_reply):
-        audio_parts.append(chunk)
-    audio_b64 = base64.b64encode(b"".join(audio_parts)).decode("ascii")
-
     return {
         "transcript": transcript,
         "assistant": assistant_reply,
-        "audio_b64": audio_b64,
     }
 
 

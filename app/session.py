@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import json
 import logging
@@ -12,12 +11,32 @@ from fastapi import WebSocket
 from .asr import StreamingTranscriber
 from .audio_buffer import AudioBuffer
 from .config import settings
-from .llm import ChatMessage, LLMConfig, LLMStreamer
+from .llm import ChatMessage, LLMStreamer
 from .logging_utils import SessionLogHandler
-from .tts import PhraseAggregator, TTSPipeline
 from .vad import SilenceTracker
 
 logger = logging.getLogger(__name__)
+
+CADENCE_PRESETS = {
+    "fast": {
+        "partial_interval_ms": 140,
+        "vad_silence_ms": 260,
+        "partial_window_s": 1.0,
+        "final_window_s": 2.2,
+    },
+    "balanced": {
+        "partial_interval_ms": settings.partial_interval_ms,
+        "vad_silence_ms": settings.vad_silence_ms,
+        "partial_window_s": settings.partial_window_s,
+        "final_window_s": settings.final_window_s,
+    },
+    "accurate": {
+        "partial_interval_ms": 400,
+        "vad_silence_ms": 700,
+        "partial_window_s": 3.5,
+        "final_window_s": 6.0,
+    },
+}
 
 
 class SessionState:
@@ -27,21 +46,20 @@ class SessionState:
         *,
         transcriber: StreamingTranscriber,
         llm: LLMStreamer,
-        tts: TTSPipeline,
     ) -> None:
         self.websocket = websocket
         self.transcriber = transcriber
         self.llm = llm
-        self.tts = tts
         self.audio_buffer = AudioBuffer(settings.sample_rate)
         self.vad = SilenceTracker(settings.sample_rate, settings.vad_silence_ms)
         self.partial_interval = settings.partial_interval_ms / 1000
+        self.partial_window_s = settings.partial_window_s
+        self.final_window_s = settings.final_window_s
         self._last_partial_time = 0.0
         self._last_partial_text = ""
         self._partial_lock = asyncio.Lock()
         self._finalize_lock = asyncio.Lock()
         self._llm_task: asyncio.Task | None = None
-        self._aggregator: PhraseAggregator | None = None
         self._metrics: dict[str, float] = {}
         self._transcript_seq = 0
         self._conversation: list[ChatMessage] = []
@@ -99,7 +117,12 @@ class SessionState:
             await self.cancel_reply()
 
     async def _handle_start(self, payload: dict[str, Any]) -> None:
+        self._metrics.clear()
         self._metrics["t0_user_audio_start"] = self._loop.time()
+        self.audio_buffer.clear()
+        self.vad.reset()
+        self._last_partial_text = ""
+        self._last_partial_time = 0.0
         sample_rate = payload.get("sample_rate")
         if sample_rate and sample_rate != settings.sample_rate:
             await self.websocket.send_json(
@@ -107,6 +130,11 @@ class SessionState:
                     "type": "info",
                     "message": f"Server expects {settings.sample_rate}Hz; received {sample_rate}Hz.",
                 }
+            )
+        cadence_label = self._apply_cadence(payload.get("cadence"))
+        if cadence_label:
+            await self.websocket.send_json(
+                {"type": "info", "message": f"Cadence set to {cadence_label}."}
             )
 
     async def _handle_stop(self) -> None:
@@ -130,7 +158,7 @@ class SessionState:
             return
         if self._partial_lock.locked():
             return
-        window = self.audio_buffer.get_window(6.0)
+        window = self.audio_buffer.get_window(self.partial_window_s)
         if not window:
             return
         async with self._partial_lock:
@@ -154,14 +182,13 @@ class SessionState:
         if self._finalize_lock.locked():
             return
         async with self._finalize_lock:
-            window = self.audio_buffer.get_window(10.0)
-            self.audio_buffer.clear()
+            audio = self.audio_buffer.pop_all()
             self.vad.reset()
             self._last_partial_text = ""
-            if not window:
+            if not audio:
                 return
             try:
-                text = await self.transcriber.transcribe(window, temperature=0.0)
+                text = await self.transcriber.transcribe(audio, temperature=0.0)
             except Exception as exc:  # pragma: no cover - defensive runtime guard
                 logger.exception("Final transcription failed", exc_info=exc)
                 await self.websocket.send_json(
@@ -169,6 +196,12 @@ class SessionState:
                 )
                 return
             if not text:
+                await self.websocket.send_json(
+                    {
+                        "type": "info",
+                        "message": "No speech detected in final segment; ignoring.",
+                    }
+                )
                 return
             now = self._loop.time()
             self._metrics["t2_final_transcript"] = now
@@ -182,12 +215,9 @@ class SessionState:
 
     async def _start_llm_reply(self) -> None:
         await self.cancel_reply()
-        self._aggregator = PhraseAggregator()
-        self._llm_task = asyncio.create_task(self._run_llm_reply(self._aggregator))
+        self._llm_task = asyncio.create_task(self._run_llm_reply())
 
-    async def _run_llm_reply(self, aggregator: PhraseAggregator) -> None:
-        sink = TTSSessionSink(self)
-        await aggregator.start(sink)
+    async def _run_llm_reply(self) -> None:
         assistant_tokens: list[str] = []
         completed = False
         try:
@@ -199,7 +229,6 @@ class SessionState:
                     {"type": "llm_token", "text": token, "done": False}
                 )
                 assistant_tokens.append(token)
-                await aggregator.add_token(token)
             completed = True
         except asyncio.CancelledError:
             logger.info("LLM reply cancelled")
@@ -208,13 +237,13 @@ class SessionState:
             logger.exception("LLM streaming failed", exc_info=exc)
             await self.websocket.send_json({"type": "error", "message": "LLM failed"})
         finally:
-            await aggregator.flush()
-            await self.websocket.send_json({"type": "tts_complete"})
             await self.websocket.send_json({"type": "llm_token", "done": True})
+            await self.websocket.send_json({"type": "reply_complete"})
             if completed:
                 reply_text = "".join(assistant_tokens).strip()
                 if reply_text:
                     self._conversation.append({"role": "assistant", "content": reply_text})
+        self._llm_task = None
 
     async def cancel_reply(self) -> None:
         if self._llm_task and not self._llm_task.done():
@@ -225,7 +254,22 @@ class SessionState:
                 pass
             await self.websocket.send_json({"type": "info", "message": "Reply cancelled"})
         self._llm_task = None
-        self._aggregator = None
+
+    def _apply_cadence(self, cadence: Any) -> str | None:
+        if not cadence:
+            return None
+        preset = str(cadence).lower()
+        params = CADENCE_PRESETS.get(preset)
+        if not params:
+            return None
+        self.partial_interval = params["partial_interval_ms"] / 1000
+        self.partial_window_s = params["partial_window_s"]
+        self.final_window_s = params["final_window_s"]
+        self.vad = SilenceTracker(settings.sample_rate, params["vad_silence_ms"])
+        self.audio_buffer.clear()
+        self._last_partial_time = 0.0
+        self._last_partial_text = ""
+        return preset
 
     def _log_metrics(self) -> None:
         if not self._metrics:
@@ -234,7 +278,7 @@ class SessionState:
         if not t0:
             return
         deltas = {}
-        for key in ("t1_first_partial", "t2_final_transcript", "t3_first_llm_token", "t4_first_tts_audio"):
+        for key in ("t1_first_partial", "t2_final_transcript", "t3_first_llm_token"):
             timestamp = self._metrics.get(key)
             if timestamp:
                 deltas[key] = round((timestamp - t0) * 1000, 2)
@@ -252,35 +296,3 @@ class SessionState:
             pass
 
 
-class TTSSessionSink:
-    def __init__(self, session: SessionState) -> None:
-        self.session = session
-
-    async def handle_phrase(self, seq: int, text: str) -> None:
-        if not text:
-            return
-        idx = 0
-        try:
-            async for chunk in self.session.tts.synthesize(text):
-                if not chunk:
-                    continue
-                now = self.session._loop.time()
-                if "t4_first_tts_audio" not in self.session._metrics:
-                    self.session._metrics["t4_first_tts_audio"] = now
-                await self.session.websocket.send_json(
-                    {
-                        "type": "tts_chunk",
-                        "seq": seq,
-                        "index": idx,
-                        "audio_b64": base64.b64encode(chunk).decode("ascii"),
-                        "mime": "audio/wav",
-                    }
-                )
-                idx += 1
-        except Exception as exc:  # pragma: no cover - runtime guard
-            logger.exception("TTS failed for seq %s", seq, exc_info=exc)
-            await self.session.websocket.send_json(
-                {"type": "error", "message": f"TTS failed for seq {seq}"}
-            )
-        finally:
-            await self.session.websocket.send_json({"type": "tts_phrase_done", "seq": seq})

@@ -68,5 +68,5 @@ class LLMStreamer:
         if not tokens:
             tokens = ["I'm", "thinking", "..."]
         for token in tokens:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.02)
             yield token + " "
